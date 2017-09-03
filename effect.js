@@ -18,7 +18,7 @@ function assetID_to_bufferID( id )
     return -1;
 }
 
-function EffectPass( renderer, is20, hasShaderTextureLOD, callback, obj, forceMuted, forcePaused, outputGainNode, copyProgram, id  )
+function EffectPass( renderer, is20, hasShaderTextureLOD, callback, obj, forceMuted, forcePaused, outputGainNode, copyProgram, id, disjointTimer)
 {
     this.mID = id;
     this.mInputs = [null, null, null, null ];
@@ -39,6 +39,10 @@ function EffectPass( renderer, is20, hasShaderTextureLOD, callback, obj, forceMu
     this.mTextureCallbackObj = obj;
     this.mForceMuted = forceMuted;
     this.mForcePaused = forcePaused;
+
+    this.mDisjointTimer = disjointTimer;
+    this.mRenderTimeQueries = [];
+    this.mDrawTime = 0;
 }
 
 EffectPass.prototype.MakeHeader_Image = function()
@@ -55,7 +59,9 @@ EffectPass.prototype.MakeHeader_Image = function()
               "uniform vec3      iChannelResolution[4];\n" +
               "uniform int       iFrame;\n" +
               "uniform float     iTimeDelta;\n" +
-              "uniform float     iFrameRate;\n";
+              "uniform float     iFrameRate;\n" +
+              "uniform float     iDrawTime;\n" +
+              "uniform float     iChannelDrawTime[4];\n";
     headerlength += 10;
 
     header += "struct Channel\n";
@@ -131,7 +137,9 @@ EffectPass.prototype.MakeHeader_Buffer = function()
               "uniform vec3      iChannelResolution[4];\n" +
               "uniform int       iFrame;\n" +
               "uniform float     iTimeDelta;\n" +
-              "uniform float     iFrameRate;\n";
+              "uniform float     iFrameRate;\n"  +
+              "uniform float     iDrawTime;\n" +
+              "uniform float     iChannelDrawTime[4];\n";
     headerlength += 10;
     for( var i=0; i<this.mInputs.length; i++ )
     {
@@ -1689,6 +1697,25 @@ EffectPass.prototype.NewTexture = function( wa, slot, url, buffers, keyboard )
 
 EffectPass.prototype.Paint_Image = function( vrData, wa, d, time, dtime, fps, mouseOriX, mouseOriY, mousePosX, mousePosY, xres, yres, buffers, keyboard )
 {
+    if (this.mDisjointTimer) {
+        for (var i = 0; i < this.mRenderTimeQueries.length; i++) {
+            var query = this.mRenderTimeQueries[i];
+
+            var available = this.mDisjointTimer.getQueryAvailable(query);
+            var disjoint = this.mDisjointTimer.isDisjoint();
+            if (available && !disjoint) {
+                var elapsed = this.mDisjointTimer.getQueryResult(query) / 1000000;
+
+                var e = Math.exp(- 1 / 10);
+
+                this.mDrawTime = (1 - e) * elapsed + e * this.mDrawTime;
+            }
+
+            this.mRenderTimeQueries.splice(i, 1);
+            i--;
+        }
+    }
+
     var times = [ 0.0, 0.0, 0.0, 0.0 ];
 
     var dates = [ d.getFullYear(), // the year (four digits)
@@ -1699,6 +1726,8 @@ EffectPass.prototype.Paint_Image = function( vrData, wa, d, time, dtime, fps, mo
     var mouse = [  mousePosX, mousePosY, mouseOriX, mouseOriY ];
 
     var resos = [ 0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0 ];
+
+    var drawTimes = new Float32Array(4);
 
     //------------------------
     
@@ -1922,6 +1951,8 @@ EffectPass.prototype.Paint_Image = function( vrData, wa, d, time, dtime, fps, mo
             {
                 this.mTextureCallbackFun( this.mTextureCallbackObj, i, {texture:inp.image, data:buffers[id].mThumbnailBuffer}, false, 9, 1, -1, this.mID );
             }
+
+            // add code updating drawTimes
         }
     }
 
@@ -1951,6 +1982,9 @@ EffectPass.prototype.Paint_Image = function( vrData, wa, d, time, dtime, fps, mo
     this.mRenderer.SetShaderConstant1I(  "iFrame", this.mFrame );
     this.mRenderer.SetShaderConstant1F(  "iTimeDelta", dtime);
     this.mRenderer.SetShaderConstant1F(  "iFrameRate", fps );
+    this.mRenderer.SetShaderConstant1F(  "iDrawTime", this.drawTime);
+    this.mRenderer.SetShaderConstant4FV(  "iChannelDrawTime", drawTimes);
+    // right now drawTimes is allways [0,0,0,0]
 
     this.mRenderer.SetShaderConstant1F(  "iChannel[0].time",       times[0] );
     this.mRenderer.SetShaderConstant1F(  "iChannel[1].time",       times[1] );
@@ -2003,7 +2037,13 @@ EffectPass.prototype.Paint_Image = function( vrData, wa, d, time, dtime, fps, mo
     else 
     {
         this.mRenderer.SetViewport([0, 0, xres, yres]);
+        if (this.mDisjointTimer)
+            this.mRenderTimeQueries.push(this.mDisjointTimer.beginQuery());
+
         this.mRenderer.DrawFullScreenTriangle_XY( l1 );
+
+        if (this.mDisjointTimer)
+            this.mDisjointTimer.endQuery();
     }
 
     this.mRenderer.DettachTextures();
@@ -2229,6 +2269,41 @@ function Effect( vr, ac, gl, xres, yres, callback, obj, forceMuted, forcePaused 
     this.mMaxBuffers = 4;
     this.mMaxPasses = this.mMaxBuffers + 1 + 1;  // some day decouple passes from buffers
     this.mBuffers = [];
+    this.mDisjointTimer = null;
+
+    // private functions
+
+    var getDisjointTimerQueryExt = function(gl, is20) {
+        var mDisjointTimer;
+
+        if( is20 )
+            var or_ext = gl.getExtension( 'EXT_disjoint_timer_query' ) || gl.getExtension( 'EXT_disjoint_timer_query_webgl2' );
+        else
+            var or_ext = gl.getExtension( 'EXT_disjoint_timer_query' );
+
+        if ( !or_ext )
+            return null;
+
+        if ( or_ext.createQueryEXT )
+            mDisjointTimer = {
+                beginQuery        : function() { var query = or_ext.createQueryEXT(); or_ext.beginQueryEXT(or_ext.TIME_ELAPSED_EXT, query); return query; },
+                endQuery          : function() { or_ext.endQueryEXT(or_ext.TIME_ELAPSED_EXT); },
+                getQueryAvailable : function( query ) { return or_ext.getQueryObjectEXT(query, or_ext.QUERY_RESULT_AVAILABLE_EXT); },
+                isDisjoint        : function() { gl.getParameter(or_ext.GPU_DISJOINT_EXT); },
+                getQueryResult    : function( query ) { return or_ext.getQueryObjectEXT(query, or_ext.QUERY_RESULT_EXT); }
+            };
+        else
+            mDisjointTimer = {
+                beginQuery        : function() { var query = gl.createQuery(); gl.beginQuery(or_ext.TIME_ELAPSED_EXT, query); return query; },
+                endQuery          : function() { gl.endQuery(or_ext.TIME_ELAPSED_EXT); },
+                getQueryAvailable : function( query ) { return gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE); },
+                isDisjoint        : function() { gl.getParameter(or_ext.GPU_DISJOINT_EXT); },
+                getQueryResult    : function( query ) { return gl.getQueryParameter(query, gl.QUERY_RESULT); }
+            };
+
+        return mDisjointTimer;
+    }
+
 
     //-------------
     if (gl == null) 
@@ -2242,6 +2317,8 @@ function Effect( vr, ac, gl, xres, yres, callback, obj, forceMuted, forcePaused 
     var caps = this.mRenderer.GetCaps();
     this.mIs20 = caps.mIsGL20;
     this.mShaderTextureLOD = caps.mShaderTextureLOD;
+
+    this.mDisjointTimer = getDisjointTimerQueryExt(gl, this.mIs20);
     //-------------
     if( ac!=null )
     {   
@@ -2752,7 +2829,7 @@ Effect.prototype.newScriptJSON = function( jobj )
     {
         this.mPasses[j] = new EffectPass( this.mRenderer, this.mIs20, this.mShaderTextureLOD,
                                           this.mTextureCallbackFun, this.mTextureCallbackObj, this.mForceMuted, this.mForcePaused, this.mGainNode, 
-                                          this.mProgramDownscale, j );
+                                          this.mProgramDownscale, j, this.mDisjointTimer);
 
         var rpass = jobj.renderpass[j];
 
@@ -2839,7 +2916,7 @@ Effect.prototype.AddPass = function( passType, passName )
     var id = this.GetNumPasses();
     this.mPasses[id] = new EffectPass( this.mRenderer, this.mIs20, this.mShaderTextureLOD,
                                        this.mTextureCallbackFun, this.mTextureCallbackObj, this.mForceMuted, this.mForcePaused, this.mGainNode, 
-                                       this.mProgramDownscale, id );
+                                       this.mProgramDownscale, id, this.mDisjointTimer );
 
     this.mPasses[id].Create( passType, passName, this.mAudioContext );
     var res = this.mPasses[id].NewShader( shaderStr );
